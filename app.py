@@ -1,8 +1,11 @@
 from flask import Flask, redirect, session, send_from_directory, request
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
+from email.message import EmailMessage
+import smtplib
 import requests
 import os
+from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -13,9 +16,69 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 oauth = OAuth(app)
 
-# =========================
+
+# =========================================================
+# EMAIL LOGIN ALERT
+# =========================================================
+
+def send_login_alert(user):
+    smtp_email = os.getenv("ALERT_EMAIL")
+    smtp_password = os.getenv("ALERT_EMAIL_PASSWORD")
+    alert_to = os.getenv("ALERT_TO_EMAIL")
+
+    if not smtp_email or not smtp_password or not alert_to:
+        print("Login alert email is not configured.")
+        return
+
+    login_time = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+    username = user.get("name") or "Unknown"
+    email = user.get("email") or "Not provided"
+    provider = user.get("provider") or "Unknown"
+    user_id = user.get("id") or "Unknown"
+
+    message = EmailMessage()
+
+    message["Subject"] = "Web-2 New Login Alert"
+    message["From"] = smtp_email
+    message["To"] = alert_to
+
+    message.set_content(
+        f"""Web-2 Login Alert
+
+A new login was completed on your website.
+
+Username: {username}
+Email: {email}
+Login provider: {provider}
+Account ID: {user_id}
+Login time: {login_time}
+
+IMPORTANT:
+The user's provider password is NOT collected, stored, or sent by Web-2.
+
+If this login was not expected, secure the corresponding
+Google or Discord account from the official provider website.
+"""
+    )
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+            server.starttls()
+            server.login(smtp_email, smtp_password)
+            server.send_message(message)
+
+        print("Login alert email sent.")
+
+    except Exception as error:
+        print("Could not send login alert:", error)
+
+
+# =========================================================
 # GOOGLE
-# =========================
+# =========================================================
 
 google = oauth.register(
     name="google",
@@ -29,30 +92,27 @@ google = oauth.register(
     }
 )
 
-# =========================
-# HOME
-# =========================
 
 @app.route("/")
 def home():
     return send_from_directory(BASE_DIR, "index.html")
 
 
-# =========================
-# GOOGLE LOGIN
-# =========================
-
 @app.route("/login/google")
 def google_login():
-    redirect_uri = "http://127.0.0.1:5000/auth/google/callback"
+    redirect_uri = (
+        os.getenv("GOOGLE_REDIRECT_URI")
+        or "http://127.0.0.1:5000/auth/google/callback"
+    )
+
     return google.authorize_redirect(redirect_uri)
 
 
 @app.route("/auth/google/callback")
 def google_callback():
-
     try:
         token = google.authorize_access_token()
+
         user = token.get("userinfo")
 
         if not user:
@@ -66,6 +126,8 @@ def google_callback():
             "picture": user.get("picture")
         }
 
+        send_login_alert(session["user"])
+
         return redirect("/account")
 
     except Exception as error:
@@ -75,31 +137,31 @@ def google_callback():
         """, 500
 
 
-# =========================
-# DISCORD LOGIN
-# =========================
+# =========================================================
+# DISCORD
+# =========================================================
 
 @app.route("/login/discord")
 def discord_login():
 
     client_id = os.getenv("DISCORD_CLIENT_ID")
 
-    redirect_uri = "http://127.0.0.1:5000/auth/discord/callback"
+    redirect_uri = (
+        os.getenv("DISCORD_REDIRECT_URI")
+        or "http://127.0.0.1:5000/auth/discord/callback"
+    )
 
     discord_url = (
         "https://discord.com/oauth2/authorize"
         "?client_id=" + client_id +
         "&response_type=code"
-        "&redirect_uri=" + requests.utils.quote(redirect_uri, safe="") +
+        "&redirect_uri=" +
+        requests.utils.quote(redirect_uri, safe="") +
         "&scope=identify%20email"
     )
 
     return redirect(discord_url)
 
-
-# =========================
-# DISCORD CALLBACK
-# =========================
 
 @app.route("/auth/discord/callback")
 def discord_callback():
@@ -117,28 +179,34 @@ def discord_callback():
     client_id = os.getenv("DISCORD_CLIENT_ID")
     client_secret = os.getenv("DISCORD_CLIENT_SECRET")
 
-    redirect_uri = "http://127.0.0.1:5000/auth/discord/callback"
+    redirect_uri = (
+        os.getenv("DISCORD_REDIRECT_URI")
+        or "http://127.0.0.1:5000/auth/discord/callback"
+    )
 
     token_response = requests.post(
-    "https://discord.com/api/v10/oauth2/token",
-    data={
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": redirect_uri
-    },
-    headers={
-        "Content-Type": "application/x-www-form-urlencoded"
-    },
-    auth=(client_id, client_secret),
-    timeout=15
-)
+        "https://discord.com/api/v10/oauth2/token",
+
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri
+        },
+
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+
+        auth=(client_id, client_secret),
+
+        timeout=15
+    )
 
     if token_response.status_code != 200:
+
         return f"""
         <h1>Discord Token Error</h1>
-
         <p>Status: {token_response.status_code}</p>
-
         <pre>{token_response.text}</pre>
         """, 400
 
@@ -151,18 +219,19 @@ def discord_callback():
 
     user_response = requests.get(
         "https://discord.com/api/v10/users/@me",
+
         headers={
             "Authorization": f"Bearer {access_token}"
         },
+
         timeout=15
     )
 
     if user_response.status_code != 200:
+
         return f"""
         <h1>Discord User Error</h1>
-
         <p>Status: {user_response.status_code}</p>
-
         <pre>{user_response.text}</pre>
         """, 400
 
@@ -171,6 +240,7 @@ def discord_callback():
     picture = None
 
     if user.get("avatar"):
+
         picture = (
             "https://cdn.discordapp.com/avatars/"
             f"{user['id']}/{user['avatar']}.png"
@@ -188,12 +258,14 @@ def discord_callback():
         "picture": picture
     }
 
+    send_login_alert(session["user"])
+
     return redirect("/account")
 
 
-# =========================
+# =========================================================
 # ACCOUNT
-# =========================
+# =========================================================
 
 @app.route("/account")
 def account():
@@ -206,10 +278,13 @@ def account():
     picture = user.get("picture")
 
     if picture:
+
         image_html = f"""
         <img src="{picture}" alt="Profile">
         """
+
     else:
+
         image_html = """
         <div class="avatar">👤</div>
         """
@@ -296,7 +371,9 @@ def account():
 
             {image_html}
 
-            <h1>Welcome, {user.get("name", "User")}!</h1>
+            <h1>
+                Welcome, {user.get("name", "User")}!
+            </h1>
 
             <p class="provider">
                 Logged in with {user.get("provider")}
@@ -306,7 +383,9 @@ def account():
                 {user.get("email") or "Email not provided"}
             </p>
 
-            <a href="/logout">Logout</a>
+            <a href="/logout">
+                Logout
+            </a>
 
         </div>
 
@@ -316,9 +395,9 @@ def account():
     """
 
 
-# =========================
+# =========================================================
 # LOGOUT
-# =========================
+# =========================================================
 
 @app.route("/logout")
 def logout():
@@ -328,11 +407,12 @@ def logout():
     return redirect("/")
 
 
-# =========================
-# START
-# =========================
+# =========================================================
+# START SERVER
+# =========================================================
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
