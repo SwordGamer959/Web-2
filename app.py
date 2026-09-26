@@ -1,6 +1,9 @@
 from flask import Flask, redirect, session, send_from_directory, request
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
+import mysql.connector
+from urllib.parse import urlsplit, unquote
 from email.message import EmailMessage
 import smtplib
 import requests
@@ -13,6 +16,79 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# =========================================================
+# MYSQL / LOCAL EMAIL-PASSWORD LOGIN
+# =========================================================
+
+def get_db_connection():
+    """
+    Connect to Railway MySQL using MYSQL_PUBLIC_URL.
+
+    Expected format:
+        mysql://USERNAME:PASSWORD@HOST:PORT/DATABASE
+
+    The URL is read from Render's environment variables and is
+    never hard-coded into the source code.
+    """
+    database_url = os.getenv("MYSQL_PUBLIC_URL")
+
+    if not database_url:
+        raise RuntimeError("MYSQL_PUBLIC_URL is not configured.")
+
+    parsed = urlsplit(database_url)
+
+    if not parsed.hostname:
+        raise RuntimeError("MYSQL_PUBLIC_URL is invalid: missing host.")
+
+    database = parsed.path.lstrip("/")
+    if not database:
+        raise RuntimeError("MYSQL_PUBLIC_URL is invalid: missing database name.")
+
+    return mysql.connector.connect(
+        host=parsed.hostname,
+        port=parsed.port or 3306,
+        user=unquote(parsed.username or ""),
+        password=unquote(parsed.password or ""),
+        database=unquote(database),
+        connection_timeout=15,
+    )
+
+
+def ensure_users_table():
+    """
+    Makes the local-login table available if it does not already exist.
+    """
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                email VARCHAR(255) NOT NULL UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP NULL
+            )
+        """)
+        connection.commit()
+        cursor.close()
+        connection.close()
+        print("✅ MySQL users table is ready.")
+    except Exception as error:
+        print("⚠️ MySQL startup check failed:", error)
+
+
+def create_local_session(user_id, email):
+    session["user"] = {
+        "provider": "Email",
+        "id": str(user_id),
+        "name": email.split("@", 1)[0],
+        "email": email,
+        "picture": None,
+    }
+
 
 oauth = OAuth(app)
 
@@ -74,6 +150,349 @@ Google or Discord account from the official provider website.
 
     except Exception as error:
         print("Could not send login alert:", error)
+
+
+
+# =========================================================
+# EMAIL/PASSWORD LOGIN
+# =========================================================
+
+@app.route("/login")
+def local_login_page():
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Web-2 Login</title>
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                background: #020617;
+                color: white;
+                font-family: Arial, sans-serif;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+            .box {
+                width: 430px;
+                max-width: 100%;
+                background: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 24px;
+                padding: 32px;
+                box-shadow: 0 25px 80px rgba(0,0,0,.55);
+            }
+            h1 { margin: 0 0 8px; }
+            p { color: #94a3b8; }
+            label {
+                display: block;
+                margin: 18px 0 8px;
+                color: #cbd5e1;
+                font-weight: bold;
+            }
+            input {
+                width: 100%;
+                padding: 13px 14px;
+                border-radius: 10px;
+                border: 1px solid #475569;
+                background: #020617;
+                color: white;
+                outline: none;
+            }
+            button, a {
+                display: block;
+                width: 100%;
+                margin-top: 16px;
+                padding: 13px 14px;
+                border-radius: 10px;
+                border: 0;
+                text-align: center;
+                text-decoration: none;
+                cursor: pointer;
+                font-weight: bold;
+            }
+            button {
+                background: #2563eb;
+                color: white;
+            }
+            .secondary {
+                background: #1e293b;
+                color: white;
+                border: 1px solid #475569;
+            }
+            .divider {
+                text-align: center;
+                color: #64748b;
+                margin: 18px 0;
+            }
+            .small {
+                font-size: 13px;
+                color: #64748b;
+                margin-top: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="box">
+            <h1>Sign in to Web-2</h1>
+            <p>Use your Web-2 account email and password.</p>
+
+            <form method="POST" action="/login/email">
+                <label for="email">Email</label>
+                <input id="email" name="email" type="email" autocomplete="email" required>
+
+                <label for="password">Password</label>
+                <input id="password" name="password" type="password"
+                       autocomplete="current-password" required>
+
+                <button type="submit">Sign in with Email</button>
+            </form>
+
+            <div class="divider">or</div>
+
+            <a class="secondary" href="/login/google">Continue with Google</a>
+            <a class="secondary" href="/login/discord">Continue with Discord</a>
+
+            <a class="secondary" href="/register">Create a Web-2 account</a>
+
+            <div class="small">
+                Web-2 never stores your email-account provider password.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.route("/register")
+def register_page():
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Create Web-2 Account</title>
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                background: #020617;
+                color: white;
+                font-family: Arial, sans-serif;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+            .box {
+                width: 430px;
+                max-width: 100%;
+                background: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 24px;
+                padding: 32px;
+            }
+            h1 { margin: 0 0 8px; }
+            p { color: #94a3b8; }
+            label {
+                display: block;
+                margin: 18px 0 8px;
+                color: #cbd5e1;
+                font-weight: bold;
+            }
+            input {
+                width: 100%;
+                padding: 13px 14px;
+                border-radius: 10px;
+                border: 1px solid #475569;
+                background: #020617;
+                color: white;
+            }
+            button, a {
+                display: block;
+                width: 100%;
+                margin-top: 16px;
+                padding: 13px 14px;
+                border-radius: 10px;
+                border: 0;
+                text-align: center;
+                text-decoration: none;
+                cursor: pointer;
+                font-weight: bold;
+            }
+            button { background: #2563eb; color: white; }
+            a {
+                background: #1e293b;
+                color: white;
+                border: 1px solid #475569;
+            }
+            .small {
+                font-size: 13px;
+                color: #64748b;
+                margin-top: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="box">
+            <h1>Create Web-2 account</h1>
+            <p>Your password will be stored only as a secure hash.</p>
+
+            <form method="POST" action="/register">
+                <label for="email">Email</label>
+                <input id="email" name="email" type="email"
+                       autocomplete="email" required>
+
+                <label for="password">Password</label>
+                <input id="password" name="password" type="password"
+                       minlength="8" autocomplete="new-password" required>
+
+                <label for="confirm_password">Confirm password</label>
+                <input id="confirm_password" name="confirm_password"
+                       type="password" minlength="8"
+                       autocomplete="new-password" required>
+
+                <button type="submit">Create account</button>
+            </form>
+
+            <a href="/login">Back to login</a>
+
+            <div class="small">
+                Do not reuse a password that you use for another important account.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/register")
+def register():
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+    confirm_password = request.form.get("confirm_password", "")
+
+    if not email or "@" not in email:
+        return "Please enter a valid email address.", 400
+
+    if len(password) < 8:
+        return "Password must be at least 8 characters.", 400
+
+    if password != confirm_password:
+        return "Passwords do not match.", 400
+
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            "SELECT id FROM users WHERE email = %s",
+            (email,)
+        )
+
+        if cursor.fetchone():
+            cursor.close()
+            connection.close()
+            return """
+                <h1>Account already exists</h1>
+                <p>This email already has a Web-2 account.</p>
+                <a href="/login">Go to login</a>
+            """, 409
+
+        password_hash = generate_password_hash(password)
+
+        cursor.execute(
+            """
+            INSERT INTO users (email, password_hash)
+            VALUES (%s, %s)
+            """,
+            (email, password_hash)
+        )
+
+        connection.commit()
+        user_id = cursor.lastrowid
+
+        cursor.close()
+        connection.close()
+
+        create_local_session(user_id, email)
+        send_login_alert(session["user"])
+
+        return redirect("/account")
+
+    except Exception as error:
+        print("Local registration error:", error)
+        return """
+            <h1>Registration error</h1>
+            <p>The database connection could not complete the request.</p>
+            <a href="/register">Try again</a>
+        """, 500
+
+
+@app.post("/login/email")
+def email_login():
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+
+    if not email or not password:
+        return "Email and password are required.", 400
+
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute(
+            """
+            SELECT id, email, password_hash
+            FROM users
+            WHERE email = %s
+            """,
+            (email,)
+        )
+
+        user = cursor.fetchone()
+
+        if not user or not check_password_hash(
+            user["password_hash"],
+            password
+        ):
+            cursor.close()
+            connection.close()
+            return """
+                <h1>Login failed</h1>
+                <p>Invalid email or password.</p>
+                <a href="/login">Try again</a>
+            """, 401
+
+        cursor.execute(
+            "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = %s",
+            (user["id"],)
+        )
+        connection.commit()
+
+        cursor.close()
+        connection.close()
+
+        create_local_session(user["id"], user["email"])
+        send_login_alert(session["user"])
+
+        return redirect("/account")
+
+    except Exception as error:
+        print("Local login error:", error)
+        return """
+            <h1>Login error</h1>
+            <p>The database connection could not complete the request.</p>
+            <a href="/login">Try again</a>
+        """, 500
 
 
 # =========================================================
@@ -406,6 +825,10 @@ def logout():
 
     return redirect("/")
 
+
+# Run the database availability/table check during normal server startup.
+# This does not contain or print any database password.
+ensure_users_table()
 
 # =========================================================
 # START SERVER

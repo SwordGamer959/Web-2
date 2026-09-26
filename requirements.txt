@@ -3,3 +3,4 @@ Authlib
 python-dotenv
 requests
 gunicorn
+mysql-connector-python
